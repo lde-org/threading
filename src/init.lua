@@ -75,6 +75,18 @@ if ffi.os == "Windows" then
 	ffi.cdef [[void* VirtualAlloc(void* addr, size_t size, unsigned long type, unsigned long protect);]]
 	exec_page = ffi.C.VirtualAlloc(nil, 4096, 0x3000, 0x40)
 	assert(exec_page ~= nil, "VirtualAlloc failed")
+	ffi.C.memcpy(exec_page, CODE, #CODE)
+elseif ffi.os == "OSX" and ffi.arch == "arm64" then
+	-- Apple Silicon: MAP_JIT required; pthread_jit_write_protect_np toggles W vs X
+	ffi.cdef [[
+		void* mmap(void* addr, size_t len, int prot, int flags, int fd, long offset);
+		void pthread_jit_write_protect_np(int enabled);
+	]]
+	exec_page = ffi.C.mmap(nil, 4096, 7, 0x1802, -1, 0)
+	assert(ffi.cast("intptr_t", exec_page) ~= -1, "mmap failed")
+	ffi.C.pthread_jit_write_protect_np(0)
+	ffi.C.memcpy(exec_page, CODE, #CODE)
+	ffi.C.pthread_jit_write_protect_np(1)
 else
 	ffi.cdef [[
 		void* mmap(void* addr, size_t len, int prot, int flags, int fd, long offset);
@@ -83,9 +95,9 @@ else
 	local map_flags = ffi.os == "OSX" and 0x1002 or 0x22
 	exec_page = ffi.C.mmap(nil, 4096, 3, map_flags, -1, 0)
 	assert(ffi.cast("intptr_t", exec_page) ~= -1, "mmap failed")
+	ffi.C.memcpy(exec_page, CODE, #CODE)
+	ffi.C.mprotect(exec_page, 4096, 5)
 end
-ffi.C.memcpy(exec_page, CODE, #CODE)
-if ffi.os ~= "Windows" then ffi.C.mprotect(exec_page, 4096, 5) end
 local thread_entry   = ffi.cast("void*(*)(void*)", exec_page)
 
 -- Cached once at load time — never recomputed per spawn.
