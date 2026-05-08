@@ -47,6 +47,9 @@ ffi.cdef([[
 		void*  fn_pcall;
 		void*  fn_close;
 		char   name[8];
+	size_t nups;
+	char*  ups;
+	size_t ups_len;
 	} thread_data_t;
 
 	void* malloc(size_t size);
@@ -61,45 +64,41 @@ ffi.cdef([[
 	int usleep(unsigned int usec);
 ]])
 
-local threading     = {}
+local threading = {}
 
 -- Compiled once. Runs inside the fresh lua_State created by the trampoline.
 -- Receives thread_data_t* as a lightuserdata via vararg (...).
 -- Calls the user bytecode, serializes the result, writes it to data.result.
 local WRAPPER_BC    = string.dump(load([[
-	local ffi = require("ffi")
+	local ffi    = require("ffi")
 	local buffer = require("string.buffer")
-
-	ffi.cdef("typedef struct { char* bc; size_t bc_len; void* _w; size_t _wl; char* result; size_t result_len; } td_t; void* malloc(size_t); void free(void*); void* memcpy(void*,const void*,size_t);")
+	ffi.cdef("typedef struct { char* bc; size_t bc_len; void* _w0; size_t _w1; char* result; size_t result_len; void* _fns[6]; char _name[8]; size_t nups; char* ups; size_t ups_len; } td_t; void* malloc(size_t); void free(void*); void* memcpy(void*,const void*,size_t);")
 
 	local data = ffi.cast("td_t*", ...)
-	local pkg = buffer.new()
-	pkg:put(ffi.string(data.bc, data.bc_len))
+	local fn   = load(ffi.string(data.bc, data.bc_len))
 	ffi.C.free(data.bc)
 	data.bc = nil
 
-	local bytecode = pkg:decode()
-	local nups     = pkg:decode()
-	local fn, err = load(bytecode)
-	local b = buffer.new()
-	if fn then
-		for i = 1, nups do debug.setupvalue(fn, i, pkg:decode()) end
-		local res = {pcall(fn)}
-		local ok  = table.remove(res, 1)
-		local n   = #res
-		b:encode(ok)
-		b:encode(n)
-		for i = 1, n do b:encode(res[i]) end
-	else
-		b:encode(false)
-		b:encode(1)
-		b:encode(err)
+	local nups = tonumber(data.nups)
+	if nups > 0 then
+		local ups = buffer.new()
+		ups:put(ffi.string(data.ups, data.ups_len))
+		ffi.C.free(data.ups)
+		data.ups = nil
+		for i = 1, nups do debug.setupvalue(fn, i, ups:decode()) end
 	end
-	local r = b:tostring()
-	local n = #r
-	data.result = ffi.C.malloc(n)
-	ffi.C.memcpy(data.result, r, n)
-	data.result_len = n
+
+	local res = {pcall(fn)}
+	local ok  = table.remove(res, 1)
+	local n   = #res
+	local b   = buffer.new()
+	b:encode(ok)
+	b:encode(n)
+	for i = 1, n do b:encode(res[i]) end
+	local ptr, rn = b:ref()
+	data.result = ffi.C.malloc(rn)
+	ffi.C.memcpy(data.result, ptr, rn)
+	data.result_len = rn
 ]]))
 
 -- x86-64 thread entry trampoline (88 bytes).
@@ -147,20 +146,22 @@ local CODE          =
 	.. "\x5B"              -- pop rbx
 	.. "\xC3"              -- ret
 
-local PROT_READ     = 0x1
-local PROT_WRITE    = 0x2
-local PROT_EXEC     = 0x4
-local MAP_PRIVATE   = 0x02
-local MAP_ANONYMOUS = 0x20
-
-local exec_page     = ffi.C.mmap(nil, 4096,
-	PROT_READ + PROT_WRITE + PROT_EXEC,
-	MAP_PRIVATE + MAP_ANONYMOUS,
-	-1, 0)
+local exec_page = ffi.C.mmap(nil, 4096, 0x7, 0x22, -1, 0) -- PROT_RWX | MAP_PRIVATE|ANON
 assert(ffi.cast("intptr_t", exec_page) ~= -1, "mmap failed")
 ffi.C.memcpy(exec_page, CODE, #CODE)
 
 local thread_entry = ffi.cast("void*(*)(void*)", exec_page)
+
+-- Cached once at load time — never recomputed per spawn.
+local DATA_SIZE      = ffi.sizeof("thread_data_t")
+local WRAPPER_PTR    = ffi.cast("char*", WRAPPER_BC)
+local WRAPPER_LEN    = #WRAPPER_BC
+local FN_NEWSTATE    = ffi.cast("void*", ffi.C.luaL_newstate)
+local FN_OPENLIBS    = ffi.cast("void*", ffi.C.luaL_openlibs)
+local FN_LOADBUFFERX = ffi.cast("void*", ffi.C.luaL_loadbufferx)
+local FN_PUSHLUD     = ffi.cast("void*", ffi.C.lua_pushlightuserdata)
+local FN_PCALL       = ffi.cast("void*", ffi.C.lua_pcall)
+local FN_CLOSE       = ffi.cast("void*", ffi.C.lua_close)
 
 ---@class threading.Handle<T>
 ---@field private _tid ffi.cdata*
@@ -181,7 +182,6 @@ end
 function Handle:join()
 	ffi.C.pthread_join(self._tid, nil)
 	local data = self._data
-	local result
 	if data.result_len > 0 then
 		local b = buffer.new()
 		b:put(ffi.string(data.result, data.result_len))
@@ -189,15 +189,15 @@ function Handle:join()
 		local ok = b:decode()
 		local n  = b:decode()
 		if not ok then
-			ffi.C.free(ffi.cast("void*", data))
+			ffi.C.free(data)
 			error("thread: " .. tostring(b:decode()), 2)
 		end
 		local results = {}
 		for i = 1, n do results[i] = b:decode() end
-		ffi.C.free(ffi.cast("void*", data))
+		ffi.C.free(data)
 		return unpack(results, 1, n)
 	end
-	ffi.C.free(ffi.cast("void*", data))
+	ffi.C.free(data)
 end
 
 local SERIALIZABLE = { ["nil"]=true, boolean=true, number=true, string=true }
@@ -206,46 +206,51 @@ local SERIALIZABLE = { ["nil"]=true, boolean=true, number=true, string=true }
 ---@param closure fun(): T
 ---@return threading.Handle<T>
 function threading.spawn(closure)
-	local nups = debug.getinfo(closure, "u").nups
-	for i = 1, nups do
-		local name, val = debug.getupvalue(closure, i)
-		if not SERIALIZABLE[type(val)] then
-			error("upvalue '" .. name .. "' has non-serializable type: " .. type(val))
-		end
-	end
+	local nups   = debug.getinfo(closure, "u").nups
+	local bc_raw = string.dump(closure)
 
-	local pkg = buffer.new()
-	pkg:encode(string.dump(closure))
-	pkg:encode(nups)
-	for i = 1, nups do
-		local _, val = debug.getupvalue(closure, i)
-		pkg:encode(val)
-	end
-
-	local bc   = pkg:tostring()
-	local len  = #bc
-
-	local data = ffi.cast("thread_data_t*", ffi.C.malloc(ffi.sizeof("thread_data_t")))
-	data.bc    = ffi.C.malloc(len)
-	ffi.C.memcpy(data.bc, bc, len)
-	data.bc_len         = len
-	data.wrapper_bc     = ffi.cast("char*", WRAPPER_BC) -- WRAPPER_BC kept alive as module var
-	data.wrapper_len    = #WRAPPER_BC
-	data.result         = nil
-	data.result_len     = 0
-	data.fn_newstate    = ffi.cast("void*", ffi.C.luaL_newstate)
-	data.fn_openlibs    = ffi.cast("void*", ffi.C.luaL_openlibs)
-	data.fn_loadbufferx = ffi.cast("void*", ffi.C.luaL_loadbufferx)
-	data.fn_pushlud     = ffi.cast("void*", ffi.C.lua_pushlightuserdata)
-	data.fn_pcall       = ffi.cast("void*", ffi.C.lua_pcall)
-	data.fn_close       = ffi.cast("void*", ffi.C.lua_close)
+	local data = ffi.cast("thread_data_t*", ffi.C.malloc(DATA_SIZE))
+	data.bc          = ffi.C.malloc(#bc_raw)
+	ffi.C.memcpy(data.bc, bc_raw, #bc_raw)
+	data.bc_len      = #bc_raw
+	data.wrapper_bc  = WRAPPER_PTR
+	data.wrapper_len = WRAPPER_LEN
+	data.result      = nil
+	data.result_len  = 0
+	data.nups        = nups
+	data.ups         = nil
+	data.ups_len     = 0
+	data.fn_newstate    = FN_NEWSTATE
+	data.fn_openlibs    = FN_OPENLIBS
+	data.fn_loadbufferx = FN_LOADBUFFERX
+	data.fn_pushlud     = FN_PUSHLUD
+	data.fn_pcall       = FN_PCALL
+	data.fn_close       = FN_CLOSE
 	ffi.copy(data.name, "entry")
+
+	if nups > 0 then
+		local pkg = buffer.new()
+		for i = 1, nups do
+			local name, val = debug.getupvalue(closure, i)
+			if not SERIALIZABLE[type(val)] then
+				ffi.C.free(data.bc)
+				ffi.C.free(data)
+				error("upvalue '" .. name .. "' has non-serializable type: " .. type(val))
+			end
+			pkg:encode(val)
+		end
+		local ptr, len = pkg:ref()
+		data.ups     = ffi.C.malloc(len)
+		ffi.C.memcpy(data.ups, ptr, len)
+		data.ups_len = len
+	end
 
 	local tid = ffi.new("pthread_t[1]")
 	local ret = ffi.C.pthread_create(tid, nil, thread_entry, ffi.cast("void*", data))
 	if ret ~= 0 then
 		ffi.C.free(data.bc)
-		ffi.C.free(ffi.cast("void*", data))
+		if nups > 0 then ffi.C.free(data.ups) end
+		ffi.C.free(data)
 		error("pthread_create failed: " .. ret)
 	end
 
