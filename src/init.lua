@@ -77,16 +77,32 @@ if ffi.os == "Windows" then
 	assert(exec_page ~= nil, "VirtualAlloc failed")
 	ffi.C.memcpy(exec_page, CODE, #CODE)
 elseif ffi.os == "OSX" and ffi.arch == "arm64" then
-	-- Apple Silicon: MAP_JIT required; pthread_jit_write_protect_np toggles W vs X
+	-- Apple Silicon: MAP_JIT required; pthread_jit_write_protect_np toggles W vs X;
+	-- sys_icache_invalidate synchronizes the instruction cache after the write
 	ffi.cdef [[
 		void* mmap(void* addr, size_t len, int prot, int flags, int fd, long offset);
 		void pthread_jit_write_protect_np(int enabled);
+		void sys_icache_invalidate(void* start, size_t len);
 	]]
 	exec_page = ffi.C.mmap(nil, 4096, 7, 0x1802, -1, 0)
 	assert(ffi.cast("intptr_t", exec_page) ~= -1, "mmap failed")
 	ffi.C.pthread_jit_write_protect_np(0)
 	ffi.C.memcpy(exec_page, CODE, #CODE)
+	ffi.C.sys_icache_invalidate(exec_page, #CODE)
 	ffi.C.pthread_jit_write_protect_np(1)
+elseif ffi.arch == "arm64" then
+	-- Linux ARM64: dcache/icache are not coherent; __clear_cache (libgcc/compiler-rt)
+	-- issues the necessary DC CVAU + IC IVAU + barriers before making the page executable
+	ffi.cdef [[
+		void* mmap(void* addr, size_t len, int prot, int flags, int fd, long offset);
+		int mprotect(void* addr, size_t len, int prot);
+		void __clear_cache(void* begin, void* end);
+	]]
+	exec_page = ffi.C.mmap(nil, 4096, 3, 0x22, -1, 0)
+	assert(ffi.cast("intptr_t", exec_page) ~= -1, "mmap failed")
+	ffi.C.memcpy(exec_page, CODE, #CODE)
+	ffi.C.__clear_cache(exec_page, ffi.cast("char*", exec_page) + #CODE)
+	ffi.C.mprotect(exec_page, 4096, 5)
 else
 	ffi.cdef [[
 		void* mmap(void* addr, size_t len, int prot, int flags, int fd, long offset);
