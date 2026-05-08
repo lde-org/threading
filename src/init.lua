@@ -76,12 +76,16 @@ if ffi.os == "Windows" then
 	exec_page = ffi.C.VirtualAlloc(nil, 4096, 0x3000, 0x40)
 	assert(exec_page ~= nil, "VirtualAlloc failed")
 else
-	ffi.cdef [[void* mmap(void* addr, size_t len, int prot, int flags, int fd, long offset);]]
+	ffi.cdef [[
+		void* mmap(void* addr, size_t len, int prot, int flags, int fd, long offset);
+		int mprotect(void* addr, size_t len, int prot);
+	]]
 	local map_flags = ffi.os == "OSX" and 0x1002 or 0x22
-	exec_page = ffi.C.mmap(nil, 4096, 7, map_flags, -1, 0)
+	exec_page = ffi.C.mmap(nil, 4096, 3, map_flags, -1, 0)
 	assert(ffi.cast("intptr_t", exec_page) ~= -1, "mmap failed")
 end
 ffi.C.memcpy(exec_page, CODE, #CODE)
+if ffi.os ~= "Windows" then ffi.C.mprotect(exec_page, 4096, 5) end
 local thread_entry   = ffi.cast("void*(*)(void*)", exec_page)
 
 -- Cached once at load time — never recomputed per spawn.
