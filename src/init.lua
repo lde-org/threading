@@ -19,43 +19,9 @@ ffi.cdef([[
 	int64_t lua_tointegerx(lua_State* L, int idx, int* isnum);
 	int lua_toboolean(lua_State* L, int idx);
 
-	/* Layout must match asm offsets exactly (all fields 8 bytes, no padding).
-	   offset  0: bc             user bytecode ptr
-	   offset  8: bc_len
-	   offset 16: wrapper_bc     precompiled wrapper chunk (not owned)
-	   offset 24: wrapper_len
-	   offset 32: result         output: malloc'd serialized result (or NULL)
-	   offset 40: result_len
-	   offset 48: fn_newstate
-	   offset 56: fn_openlibs
-	   offset 64: fn_loadbufferx
-	   offset 72: fn_pushlud     lua_pushlightuserdata
-	   offset 80: fn_pcall
-	   offset 88: fn_close
-	   offset 96: name[8]        "entry\0\0\0" */
-	typedef struct {
-		char*  bc;
-		size_t bc_len;
-		char*  wrapper_bc;
-		size_t wrapper_len;
-		char*  result;
-		size_t result_len;
-		void*  fn_newstate;
-		void*  fn_openlibs;
-		void*  fn_loadbufferx;
-		void*  fn_pushlud;
-		void*  fn_pcall;
-		void*  fn_close;
-		char   name[8];
-	size_t nups;
-	char*  ups;
-	size_t ups_len;
-	} thread_data_t;
-
 	void* malloc(size_t size);
 	void  free(void* ptr);
 	void* memcpy(void* dest, const void* src, size_t n);
-	void* mmap(void* addr, size_t len, int prot, int flags, int fd, long offset);
 
 	typedef unsigned long pthread_t;
 	int pthread_create(pthread_t* thread, const void* attr, void*(*start)(void*), void* arg);
@@ -64,12 +30,14 @@ ffi.cdef([[
 	int usleep(unsigned int usec);
 ]])
 
-local threading = {}
+ffi.cdef(require("threading.cdef"))
+
+local threading  = {}
 
 -- Compiled once. Runs inside the fresh lua_State created by the trampoline.
 -- Receives thread_data_t* as a lightuserdata via vararg (...).
 -- Calls the user bytecode, serializes the result, writes it to data.result.
-local WRAPPER_BC    = string.dump(load([[
+local WRAPPER_BC = string.dump(load([[
 	local ffi    = require("ffi")
 	local buffer = require("string.buffer")
 	ffi.cdef("typedef struct { char* bc; size_t bc_len; void* _w0; size_t _w1; char* result; size_t result_len; void* _fns[6]; char _name[8]; size_t nups; char* ups; size_t ups_len; } td_t; void* malloc(size_t); void free(void*); void* memcpy(void*,const void*,size_t);")
@@ -101,56 +69,20 @@ local WRAPPER_BC    = string.dump(load([[
 	data.result_len = rn
 ]]))
 
--- x86-64 thread entry trampoline (88 bytes).
--- rdi = thread_data_t*. Bootstraps a fresh lua_State, loads the precompiled
--- Lua wrapper, passes data* as a lightuserdata arg, runs it, then closes.
--- Never reads or writes the parent LuaJIT state.
---
--- rbx = data*  (callee-saved, no SIB needed for [rbx+N])
--- r14 = L      (callee-saved, no SIB needed for [r14+N])
---
--- Offsets used: fn_newstate=48(0x30) fn_openlibs=56(0x38)
---               fn_loadbufferx=64(0x40) fn_pushlud=72(0x48)
---               fn_pcall=80(0x50) fn_close=88(0x58) name=96(0x60)
---               wrapper_bc=16(0x10) wrapper_len=24(0x18)
-local CODE          =
-	"\x53"                 -- push rbx
-	.. "\x41\x56"          -- push r14
-	.. "\x48\x83\xEC\x08"  -- sub rsp, 8                 align
-	.. "\x48\x89\xFB"      -- mov rbx, rdi              rbx = data*
-	.. "\xFF\x53\x30"      -- call [rbx+48]             luaL_newstate()
-	.. "\x48\x85\xC0"      -- test rax, rax
-	.. "\x74\x3C"          -- jz .done                  78-18=60=0x3C
-	.. "\x49\x89\xC6"      -- mov r14, rax              r14 = L
-	.. "\x4C\x89\xF7"      -- mov rdi, r14
-	.. "\xFF\x53\x38"      -- call [rbx+56]             luaL_openlibs(L)
-	.. "\x4C\x89\xF7"      -- mov rdi, r14
-	.. "\x48\x8B\x73\x10"  -- mov rsi, [rbx+16]         wrapper_bc
-	.. "\x48\x8B\x53\x18"  -- mov rdx, [rbx+24]         wrapper_len
-	.. "\x48\x8D\x4B\x60"  -- lea rcx, [rbx+96]         name
-	.. "\x45\x31\xC0"      -- xor r8d, r8d              mode=NULL
-	.. "\xFF\x53\x40"      -- call [rbx+64]             luaL_loadbufferx(...)
-	.. "\x4C\x89\xF7"      -- mov rdi, r14
-	.. "\x48\x89\xDE"      -- mov rsi, rbx              data*
-	.. "\xFF\x53\x48"      -- call [rbx+72]             lua_pushlightuserdata(L, data)
-	.. "\x4C\x89\xF7"      -- mov rdi, r14
-	.. "\xBE\x01\x00\x00\x00" -- mov esi, 1                nargs=1
-	.. "\x31\xD2"          -- xor edx, edx              nresults=0
-	.. "\x31\xC9"          -- xor ecx, ecx              errfunc=0
-	.. "\xFF\x53\x50"      -- call [rbx+80]             lua_pcall(L,1,0,0)
-	.. "\x4C\x89\xF7"      -- mov rdi, r14
-	.. "\xFF\x53\x58"      -- call [rbx+88]             lua_close(L)
-	.. "\x31\xC0"          -- .done: xor eax, eax       return NULL
-	.. "\x48\x83\xC4\x08"  -- add rsp, 8
-	.. "\x41\x5E"          -- pop r14
-	.. "\x5B"              -- pop rbx
-	.. "\xC3"              -- ret
-
-local exec_page = ffi.C.mmap(nil, 4096, 0x7, 0x22, -1, 0) -- PROT_RWX | MAP_PRIVATE|ANON
-assert(ffi.cast("intptr_t", exec_page) ~= -1, "mmap failed")
+local CODE       = require("threading.trampoline")
+local exec_page
+if ffi.os == "Windows" then
+	ffi.cdef [[void* VirtualAlloc(void* addr, size_t size, unsigned long type, unsigned long protect);]]
+	exec_page = ffi.C.VirtualAlloc(nil, 4096, 0x3000, 0x40)
+	assert(exec_page ~= nil, "VirtualAlloc failed")
+else
+	ffi.cdef [[void* mmap(void* addr, size_t len, int prot, int flags, int fd, long offset);]]
+	local map_flags = ffi.os == "OSX" and 0x1002 or 0x22
+	exec_page = ffi.C.mmap(nil, 4096, 7, map_flags, -1, 0)
+	assert(ffi.cast("intptr_t", exec_page) ~= -1, "mmap failed")
+end
 ffi.C.memcpy(exec_page, CODE, #CODE)
-
-local thread_entry = ffi.cast("void*(*)(void*)", exec_page)
+local thread_entry   = ffi.cast("void*(*)(void*)", exec_page)
 
 -- Cached once at load time — never recomputed per spawn.
 local DATA_SIZE      = ffi.sizeof("thread_data_t")
@@ -166,8 +98,8 @@ local FN_CLOSE       = ffi.cast("void*", ffi.C.lua_close)
 ---@class threading.Handle<T>
 ---@field private _tid ffi.cdata*
 ---@field private _data ffi.cdata*
-local Handle = {}
-Handle.__index = Handle
+local Handle         = {}
+Handle.__index       = Handle
 
 ---@param tid ffi.cdata*
 ---@param data ffi.cdata*
@@ -200,7 +132,7 @@ function Handle:join()
 	ffi.C.free(data)
 end
 
-local SERIALIZABLE = { ["nil"]=true, boolean=true, number=true, string=true }
+local SERIALIZABLE = { ["nil"] = true, boolean = true, number = true, string = true }
 
 ---@generic T
 ---@param closure fun(): T
@@ -209,17 +141,17 @@ function threading.spawn(closure)
 	local nups   = debug.getinfo(closure, "u").nups
 	local bc_raw = string.dump(closure)
 
-	local data = ffi.cast("thread_data_t*", ffi.C.malloc(DATA_SIZE))
-	data.bc          = ffi.C.malloc(#bc_raw)
+	local data   = ffi.cast("thread_data_t*", ffi.C.malloc(DATA_SIZE))
+	data.bc      = ffi.C.malloc(#bc_raw)
 	ffi.C.memcpy(data.bc, bc_raw, #bc_raw)
-	data.bc_len      = #bc_raw
-	data.wrapper_bc  = WRAPPER_PTR
-	data.wrapper_len = WRAPPER_LEN
-	data.result      = nil
-	data.result_len  = 0
-	data.nups        = nups
-	data.ups         = nil
-	data.ups_len     = 0
+	data.bc_len         = #bc_raw
+	data.wrapper_bc     = WRAPPER_PTR
+	data.wrapper_len    = WRAPPER_LEN
+	data.result         = nil
+	data.result_len     = 0
+	data.nups           = nups
+	data.ups            = nil
+	data.ups_len        = 0
 	data.fn_newstate    = FN_NEWSTATE
 	data.fn_openlibs    = FN_OPENLIBS
 	data.fn_loadbufferx = FN_LOADBUFFERX
@@ -240,7 +172,7 @@ function threading.spawn(closure)
 			pkg:encode(val)
 		end
 		local ptr, len = pkg:ref()
-		data.ups     = ffi.C.malloc(len)
+		data.ups       = ffi.C.malloc(len)
 		ffi.C.memcpy(data.ups, ptr, len)
 		data.ups_len = len
 	end
