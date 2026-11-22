@@ -50,6 +50,33 @@ if handle:done() then
 end
 ```
 
+### A pool of workers
+
+Starting a thread makes a Lua state and fills it with modules, which is too much to pay per item
+when a program decodes many similar things -- covers, thumbnails, samples. A pool keeps a few
+threads (and their states, modules and JIT traces) and runs one function over many jobs:
+
+```lua
+local pool = threading.pool(2, function(path, size)
+    local image = require("image")
+    return image.load(path, { width = size, height = size })
+end)
+
+local handle = pool:run("cover.jpg", 512)
+if handle ~= nil then
+    -- every frame:
+    if handle:done() then
+        local picture = handle:join()
+        -- the worker that ran this job is free for another `run`
+    end
+end
+```
+
+The function takes the arguments `run` was given rather than closing over them. Its own upvalues
+are copied once, when the pool is made, and must be something `string.buffer` can copy.
+`run` answers `nil` while every worker is busy; `close` stops the pool after letting a running job
+finish.
+
 ### Passing data in
 
 A thread's upvalues are copied into it. Each must be something `string.buffer` can copy: `nil`, a

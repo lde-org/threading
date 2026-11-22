@@ -34,9 +34,26 @@ native.CDEF = [[
 		int done;
 	} threading_job;
 
+	typedef struct threading_worker {
+		const threading_api* api;
+		char* runner;
+		size_t runner_len;
+		char* input;
+		size_t input_len;
+	} threading_worker;
+
 	int threading_start(threading_job* job);
 	int threading_done(threading_job* job);
 	void threading_join(threading_job* job);
+	threading_worker* threading_worker_new(const threading_api* api, const char* runner, size_t runner_len, const char* input, size_t input_len);
+	int threading_worker_start(threading_worker* worker);
+	int threading_worker_push(threading_worker* worker, threading_job* job);
+	threading_job* threading_worker_wait(threading_worker* worker);
+	void threading_worker_finish(threading_worker* worker, threading_job* job);
+	void threading_job_wait(threading_worker* worker, threading_job* job);
+	void threading_worker_free_input(threading_worker* worker);
+	void threading_worker_stop(threading_worker* worker);
+	void threading_worker_free(threading_worker* worker);
 	void* threading_alloc(size_t size);
 	void threading_free(void* pointer);
 	void threading_sleep(unsigned int milliseconds);
@@ -142,6 +159,39 @@ function native.copy(text)
 	assert(pointer ~= nil or #text == 0, "threading: out of memory")
 	ffi.copy(pointer, text, #text)
 	return pointer, #text
+end
+
+--- A worker with its runner and startup payload copied in, ready to start.
+---@param runner string
+---@param payload string
+---@return ffi.cdata* worker
+function native.newWorker(runner, payload)
+	local worker = native.lib.threading_worker_new(native.api, runner, #runner, payload, #payload)
+	assert(worker ~= nil, "threading: out of memory")
+	return worker
+end
+
+---@param worker ffi.cdata*
+---@param job ffi.cdata*
+---@return number refused # Nonzero when the worker is busy or stopping
+function native.push(worker, job)
+	return native.lib.threading_worker_push(worker, job)
+end
+
+---@param worker ffi.cdata*
+---@param job ffi.cdata*
+function native.waitJob(worker, job)
+	native.lib.threading_job_wait(worker, job)
+end
+
+---@param worker ffi.cdata*
+function native.stopWorker(worker)
+	native.lib.threading_worker_stop(worker)
+end
+
+---@param worker ffi.cdata*
+function native.freeWorker(worker)
+	native.lib.threading_worker_free(worker)
 end
 
 return native

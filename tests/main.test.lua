@@ -95,3 +95,54 @@ test.it("starts and joins many threads in a row", function()
 		test.equal(threading.spawn(function() return index end):join(), index)
 	end
 end)
+
+test.it("runs many jobs on one worker", function()
+	local pool = threading.pool(1, function(value) return value * 2 end)
+	for index = 1, 5 do
+		local handle = pool:run(index)
+		test.truthy(handle ~= nil, "a free worker takes the job")
+		test.equal(handle:join(), index * 2)
+	end
+	pool:close()
+end)
+
+test.it("hands jobs to a pool's free workers", function()
+	local pool = threading.pool(2, function(value)
+		require("threading").sleep(50)
+		return value
+	end)
+	local first = pool:run(1)
+	local second = pool:run(2)
+	test.truthy(first ~= nil and second ~= nil, "both workers take a job")
+	test.equal(pool:run(3), nil, "a busy pool refuses another job")
+	test.equal(first:join(), 1)
+	local third = pool:run(3)
+	test.truthy(third ~= nil, "a joined worker is free again")
+	test.equal(second:join(), 2)
+	test.equal(third:join(), 3)
+	pool:close()
+end)
+
+test.it("keeps a pool worker's state between jobs", function()
+	local seen = 0
+	local pool = threading.pool(1, function(delta)
+		seen += delta
+		return seen
+	end)
+	test.equal(pool:run(1):join(), 1)
+	test.equal(pool:run(2):join(), 3)
+	pool:close()
+end)
+
+test.it("raises a job's error without stopping the pool", function()
+	local pool = threading.pool(1, function(fail)
+		if fail then error("job failed") end
+		return "ok"
+	end)
+	local bad = pool:run(true)
+	local ok, err = pcall(bad.join, bad)
+	test.falsy(ok)
+	test.truthy(tostring(err):find("job failed", 1, true), err)
+	test.equal(pool:run(false):join(), "ok")
+	pool:close()
+end)
