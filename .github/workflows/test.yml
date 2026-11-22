@@ -32,6 +32,7 @@ jobs:
         with:
           version: nightly
           platform: ${{ matrix.android && 'Android' || '' }}
+          toolchain: true
 
       - name: Run tests
         if: "!matrix.android"
