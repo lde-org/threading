@@ -7,6 +7,7 @@
  * pointers, so this works whatever executable or library the Lua runtime lives in. */
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -86,6 +87,37 @@ typedef struct threading_worker {
 	pthread_cond_t finished;
 #endif
 } threading_worker;
+
+/* A queue of byte strings that threads hand each other. A program makes one on the thread that
+ * will read it and passes the other thread its address; the reader pushes answers down a second
+ * channel. Every message is copied in and out, so the Lua states on either side share no value.
+ *
+ * A channel is reference counted: the state that made it holds one reference, and each state that
+ * attaches to it by address takes another. Closing it wakes whoever waits, refuses further pushes,
+ * and lets what is already queued still be popped; the memory goes when the last reference does.
+ *
+ * `refs` is the only field read or written without the lock. Everything else is under it, which is
+ * what makes the wait and a push from the other thread safe. */
+typedef struct threading_message {
+	struct threading_message* next;
+	char* bytes;
+	size_t len;
+} threading_message;
+
+typedef struct threading_channel {
+#ifdef _WIN32
+	CRITICAL_SECTION lock;
+	CONDITION_VARIABLE wake;
+#else
+	pthread_mutex_t lock;
+	pthread_cond_t wake;
+#endif
+	threading_message* head;
+	threading_message* tail;
+	size_t count;
+	int closed;
+	int refs;
+} threading_channel;
 
 static char* copy_text(const char* text, size_t len)
 {
@@ -383,6 +415,211 @@ THREADING_EXPORT void threading_worker_free(threading_worker* worker)
 	free(worker->input);
 	free(worker->error);
 	free(worker);
+}
+
+/* ── channels ──────────────────────────────────────────────────────────────────────────────── */
+
+#ifdef _WIN32
+#define CHANNEL_LOCK(channel) EnterCriticalSection(&(channel)->lock)
+#define CHANNEL_UNLOCK(channel) LeaveCriticalSection(&(channel)->lock)
+#define CHANNEL_WAKE(channel) WakeAllConditionVariable(&(channel)->wake)
+#else
+#define CHANNEL_LOCK(channel) pthread_mutex_lock(&(channel)->lock)
+#define CHANNEL_UNLOCK(channel) pthread_mutex_unlock(&(channel)->lock)
+#define CHANNEL_WAKE(channel) pthread_cond_broadcast(&(channel)->wake)
+#endif
+
+static void channel_free_messages(threading_channel* channel)
+{
+	threading_message* message = channel->head;
+	while (message != NULL) {
+		threading_message* next = message->next;
+		free(message->bytes);
+		free(message);
+		message = next;
+	}
+	channel->head = NULL;
+	channel->tail = NULL;
+	channel->count = 0;
+}
+
+/* A channel with one reference, held by the state that made it. */
+THREADING_EXPORT threading_channel* threading_channel_new(void)
+{
+	threading_channel* channel = (threading_channel*)calloc(1, sizeof(threading_channel));
+	if (channel == NULL) return NULL;
+
+#ifdef _WIN32
+	InitializeCriticalSection(&channel->lock);
+	InitializeConditionVariable(&channel->wake);
+#else
+	pthread_mutex_init(&channel->lock, NULL);
+	pthread_cond_init(&channel->wake, NULL);
+#endif
+	channel->refs = 1;
+	return channel;
+}
+
+/* Another state is going to use the channel: the thread it was passed to keeps it alive while it
+ * works, whatever the state that made it does with its own reference. */
+THREADING_EXPORT void threading_channel_ref(threading_channel* channel)
+{
+	if (channel == NULL) return;
+#ifdef _WIN32
+	InterlockedIncrement((volatile LONG*)&channel->refs);
+#else
+	__atomic_add_fetch(&channel->refs, 1, __ATOMIC_RELAXED);
+#endif
+}
+
+/* Gives back one reference. The last one frees the queue and the channel. A channel with a thread
+ * still waiting on it must not lose its last reference: closing it first is what wakes that
+ * thread, and its own reference is given back when it is done. */
+THREADING_EXPORT void threading_channel_unref(threading_channel* channel)
+{
+	if (channel == NULL) return;
+#ifdef _WIN32
+	long remaining = InterlockedDecrement((volatile LONG*)&channel->refs);
+#else
+	int remaining = __atomic_sub_fetch(&channel->refs, 1, __ATOMIC_ACQ_REL);
+#endif
+	if (remaining != 0) return;
+
+	channel_free_messages(channel);
+#ifdef _WIN32
+	DeleteCriticalSection(&channel->lock);
+#else
+	pthread_mutex_destroy(&channel->lock);
+	pthread_cond_destroy(&channel->wake);
+#endif
+	free(channel);
+}
+
+/* Refuses anything more and wakes a thread waiting for a message. What is already queued can still
+ * be popped, so a quit command pushed just before closing is not lost. */
+THREADING_EXPORT void threading_channel_close(threading_channel* channel)
+{
+	if (channel == NULL) return;
+	CHANNEL_LOCK(channel);
+	channel->closed = 1;
+	CHANNEL_WAKE(channel);
+	CHANNEL_UNLOCK(channel);
+}
+
+/* Copies one message in and wakes a waiting reader. Nonzero is a channel that was closed, or a
+ * message the allocator could not make room for. */
+THREADING_EXPORT int threading_channel_push(threading_channel* channel, const char* bytes, size_t len)
+{
+	if (channel == NULL) return 1;
+
+	threading_message* message = (threading_message*)malloc(sizeof(threading_message));
+	if (message == NULL) return 1;
+	size_t room = len > 0 ? len : 1;
+	message->bytes = (char*)malloc(room);
+	if (message->bytes == NULL) {
+		free(message);
+		return 1;
+	}
+	if (len > 0) memcpy(message->bytes, bytes, len);
+	message->len = len;
+	message->next = NULL;
+
+	CHANNEL_LOCK(channel);
+	if (channel->closed) {
+		CHANNEL_UNLOCK(channel);
+		free(message->bytes);
+		free(message);
+		return 1;
+	}
+
+	if (channel->tail != NULL) {
+		channel->tail->next = message;
+	} else {
+		channel->head = message;
+	}
+	channel->tail = message;
+	channel->count++;
+	CHANNEL_WAKE(channel);
+	CHANNEL_UNLOCK(channel);
+	return 0;
+}
+
+/* Takes the oldest message out, as memory the caller frees with threading_free. Answers NULL when
+ * there is none; `length` is set to its size. */
+THREADING_EXPORT char* threading_channel_pop(threading_channel* channel, size_t* length)
+{
+	if (length != NULL) *length = 0;
+	if (channel == NULL) return NULL;
+
+	CHANNEL_LOCK(channel);
+	threading_message* message = channel->head;
+	if (message != NULL) {
+		channel->head = message->next;
+		if (channel->head == NULL) channel->tail = NULL;
+		channel->count--;
+	}
+	CHANNEL_UNLOCK(channel);
+
+	if (message == NULL) return NULL;
+	char* bytes = message->bytes;
+	if (length != NULL) *length = message->len;
+	free(message);
+	return bytes;
+}
+
+#ifndef _WIN32
+static void channel_deadline(struct timespec* deadline, unsigned int milliseconds)
+{
+	clock_gettime(CLOCK_REALTIME, deadline);
+	deadline->tv_sec += (time_t)(milliseconds / 1000);
+	deadline->tv_nsec += (long)(milliseconds % 1000) * 1000000L;
+	if (deadline->tv_nsec >= 1000000000L) {
+		deadline->tv_sec += 1;
+		deadline->tv_nsec -= 1000000000L;
+	}
+}
+#endif
+
+/* Waits up to `milliseconds` for a message to be queued. Answers 1 when there is one to pop, 0
+ * when the time ran out or the channel closed with nothing in it. A wait of 0 only looks. */
+THREADING_EXPORT int threading_channel_wait(threading_channel* channel, unsigned int milliseconds)
+{
+	if (channel == NULL) return 0;
+
+	int available = 0;
+#ifdef _WIN32
+	CHANNEL_LOCK(channel);
+	ULONGLONG started = GetTickCount64();
+	while (channel->count == 0 && !channel->closed) {
+		ULONGLONG spent = GetTickCount64() - started;
+		if (milliseconds == 0 || spent >= milliseconds) break;
+		SleepConditionVariableCS(&channel->wake, &channel->lock, (DWORD)(milliseconds - spent));
+	}
+	available = channel->count > 0;
+	CHANNEL_UNLOCK(channel);
+#else
+	CHANNEL_LOCK(channel);
+	if (channel->count == 0 && !channel->closed && milliseconds > 0) {
+		struct timespec deadline;
+		channel_deadline(&deadline, milliseconds);
+		while (channel->count == 0 && !channel->closed) {
+			if (pthread_cond_timedwait(&channel->wake, &channel->lock, &deadline) == ETIMEDOUT) break;
+		}
+	}
+	available = channel->count > 0;
+	CHANNEL_UNLOCK(channel);
+#endif
+	return available;
+}
+
+/* How many messages are waiting. What a reader asks when it wants to drain without blocking. */
+THREADING_EXPORT size_t threading_channel_count(threading_channel* channel)
+{
+	if (channel == NULL) return 0;
+	CHANNEL_LOCK(channel);
+	size_t count = channel->count;
+	CHANNEL_UNLOCK(channel);
+	return count;
 }
 
 /* Memory the threads hand back, freed by the allocator that made it. */

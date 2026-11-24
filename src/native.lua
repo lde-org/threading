@@ -42,6 +42,17 @@ native.CDEF = [[
 		size_t input_len;
 	} threading_worker;
 
+	typedef struct threading_channel threading_channel;
+
+	threading_channel* threading_channel_new(void);
+	void threading_channel_ref(threading_channel* channel);
+	void threading_channel_unref(threading_channel* channel);
+	void threading_channel_close(threading_channel* channel);
+	int threading_channel_push(threading_channel* channel, const char* bytes, size_t len);
+	char* threading_channel_pop(threading_channel* channel, size_t* length);
+	int threading_channel_wait(threading_channel* channel, unsigned int milliseconds);
+	size_t threading_channel_count(threading_channel* channel);
+
 	int threading_start(threading_job* job);
 	int threading_done(threading_job* job);
 	void threading_join(threading_job* job);

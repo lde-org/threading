@@ -352,4 +352,112 @@ function threading.sleep(milliseconds)
 	lib.threading_sleep(math.max(0, math.floor(milliseconds)))
 end
 
+---@class threading.Channel
+---@field private channel ffi.cdata*? # The C channel; nil once closed
+---@field private length ffi.cdata* # Scratch for pop's size, kept so a pop does not allocate
+local Channel = {}
+Channel.__index = Channel
+
+--- A pointer as eight raw bytes, which is how a channel crosses to another thread: a Lua number
+--- would lose the top bits of an address on arm64, where Android tags heap pointers above 2^53.
+---@param pointer ffi.cdata*
+---@return string
+local function addressOf(pointer)
+	return ffi.string(ffi.new("void*[1]", pointer), ffi.sizeof("void*"))
+end
+
+---@param address string
+---@return ffi.cdata* pointer
+local function pointerOf(address)
+	assert(#address == ffi.sizeof("void*"), "threading: a channel address is the size of a pointer")
+	return ffi.cast("threading_channel*", ffi.cast("void* const*", address)[0])
+end
+
+--- A channel of our own: messages are queued on it, and another thread is handed its address with
+--- `address`, attaching to it with `threading.channelFromAddress`. What is pushed is copied with
+--- string.buffer -- nil, booleans, numbers, strings and tables of those -- and never shared.
+---@return threading.Channel
+function threading.channel()
+	local pointer = lib.threading_channel_new()
+	assert(pointer ~= nil, "threading: out of memory")
+	return setmetatable({ channel = pointer, length = ffi.new("size_t[1]") }, Channel)
+end
+
+--- Attaches to a channel another thread made, from the address it handed over. The channel is kept
+--- alive by this reference until `close`, whatever the other thread does with its own.
+---@param address string
+---@return threading.Channel
+function threading.channelFromAddress(address)
+	local pointer = pointerOf(address)
+	lib.threading_channel_ref(pointer)
+	return setmetatable({ channel = pointer, length = ffi.new("size_t[1]") }, Channel)
+end
+
+--- The eight bytes another thread needs to attach to this channel.
+---@return string
+function Channel:address()
+	local pointer = self.channel
+	assert(pointer ~= nil, "threading: a closed channel has no address")
+	return addressOf(pointer)
+end
+
+--- Queues values for whoever reads the channel, without waiting. Answers false when the channel is
+--- closed. Each value must be something string.buffer can copy: nil, a boolean, a number, a
+--- string, or a table of those.
+---@param ... any
+---@return boolean pushed
+function Channel:push(...)
+	local pointer = self.channel
+	if pointer == nil then return false end
+	local packed = buffer.encode({ n = select("#", ...), ... })
+	return lib.threading_channel_push(pointer, packed, #packed) == 0
+end
+
+--- Takes the oldest message, without waiting: nil when the channel is empty. What was pushed is
+--- answered as the values it was pushed with.
+---@return any ...
+function Channel:pop()
+	local pointer = self.channel
+	if pointer == nil then return nil end
+
+	local length = self.length
+	local bytes = lib.threading_channel_pop(pointer, length)
+	if bytes == nil then return nil end
+
+	local packed = ffi.string(bytes, length[0])
+	lib.threading_free(bytes)
+	local decoded = buffer.decode(packed)
+	return unpack(decoded, 1, decoded.n)
+end
+
+--- Waits until a message is queued, or the time runs out. Answers whether there is one to pop. A
+--- wait of 0 only looks, which is the same question `count` answers.
+---@param milliseconds number
+---@return boolean available
+function Channel:wait(milliseconds)
+	local pointer = self.channel
+	if pointer == nil then return false end
+	return lib.threading_channel_wait(pointer, math.max(0, math.floor(milliseconds or 0))) ~= 0
+end
+
+--- How many messages are waiting.
+---@return number
+function Channel:count()
+	local pointer = self.channel
+	if pointer == nil then return 0 end
+	return tonumber(lib.threading_channel_count(pointer))
+end
+
+--- Gives this state's reference back and wakes a reader, if this is the state that closes it. What
+--- is already queued can still be popped; nothing more can be pushed. Closing twice does nothing.
+function Channel:close()
+	local pointer = self.channel
+	if pointer == nil then return end
+	self.channel = nil
+	lib.threading_channel_close(pointer)
+	lib.threading_channel_unref(pointer)
+end
+
+Channel.__gc = Channel.close
+
 return threading
