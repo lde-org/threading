@@ -568,7 +568,7 @@ THREADING_EXPORT char* threading_channel_pop(threading_channel* channel, size_t*
 }
 
 #ifndef _WIN32
-static void channel_deadline(struct timespec* deadline, unsigned int milliseconds)
+static void channel_deadline(struct timespec* deadline, long long milliseconds)
 {
 	clock_gettime(CLOCK_REALTIME, deadline);
 	deadline->tv_sec += (time_t)(milliseconds / 1000);
@@ -580,30 +580,44 @@ static void channel_deadline(struct timespec* deadline, unsigned int millisecond
 }
 #endif
 
-/* Waits up to `milliseconds` for a message to be queued. Answers 1 when there is one to pop, 0
- * when the time ran out or the channel closed with nothing in it. A wait of 0 only looks. */
-THREADING_EXPORT int threading_channel_wait(threading_channel* channel, unsigned int milliseconds)
+/* Waits for a message to be queued. Answers 1 when there is one to pop, 0 when the time ran out or
+ * the channel closed with nothing in it. A wait of 0 only looks. A negative `milliseconds` waits
+ * without a timeout -- until a message arrives or the channel closes -- and the loop is what makes
+ * a spurious wakeup of the condition variable harmless. */
+THREADING_EXPORT int threading_channel_wait(threading_channel* channel, long long milliseconds)
 {
 	if (channel == NULL) return 0;
 
 	int available = 0;
 #ifdef _WIN32
 	CHANNEL_LOCK(channel);
-	ULONGLONG started = GetTickCount64();
-	while (channel->count == 0 && !channel->closed) {
-		ULONGLONG spent = GetTickCount64() - started;
-		if (milliseconds == 0 || spent >= milliseconds) break;
-		SleepConditionVariableCS(&channel->wake, &channel->lock, (DWORD)(milliseconds - spent));
+	if (milliseconds < 0) {
+		while (channel->count == 0 && !channel->closed) {
+			SleepConditionVariableCS(&channel->wake, &channel->lock, INFINITE);
+		}
+	} else {
+		ULONGLONG started = GetTickCount64();
+		while (channel->count == 0 && !channel->closed) {
+			ULONGLONG spent = GetTickCount64() - started;
+			if (milliseconds == 0 || spent >= (ULONGLONG)milliseconds) break;
+			SleepConditionVariableCS(&channel->wake, &channel->lock, (DWORD)((ULONGLONG)milliseconds - spent));
+		}
 	}
 	available = channel->count > 0;
 	CHANNEL_UNLOCK(channel);
 #else
 	CHANNEL_LOCK(channel);
-	if (channel->count == 0 && !channel->closed && milliseconds > 0) {
-		struct timespec deadline;
-		channel_deadline(&deadline, milliseconds);
-		while (channel->count == 0 && !channel->closed) {
-			if (pthread_cond_timedwait(&channel->wake, &channel->lock, &deadline) == ETIMEDOUT) break;
+	if (channel->count == 0 && !channel->closed) {
+		if (milliseconds < 0) {
+			while (channel->count == 0 && !channel->closed) {
+				pthread_cond_wait(&channel->wake, &channel->lock);
+			}
+		} else if (milliseconds > 0) {
+			struct timespec deadline;
+			channel_deadline(&deadline, milliseconds);
+			while (channel->count == 0 && !channel->closed) {
+				if (pthread_cond_timedwait(&channel->wake, &channel->lock, &deadline) == ETIMEDOUT) break;
+			}
 		}
 	}
 	available = channel->count > 0;

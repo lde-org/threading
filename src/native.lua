@@ -50,7 +50,7 @@ native.CDEF = [[
 	void threading_channel_close(threading_channel* channel);
 	int threading_channel_push(threading_channel* channel, const char* bytes, size_t len);
 	char* threading_channel_pop(threading_channel* channel, size_t* length);
-	int threading_channel_wait(threading_channel* channel, unsigned int milliseconds);
+	int threading_channel_wait(threading_channel* channel, long long milliseconds);
 	size_t threading_channel_count(threading_channel* channel);
 
 	int threading_start(threading_job* job);

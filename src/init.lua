@@ -431,12 +431,17 @@ function Channel:pop()
 end
 
 --- Waits until a message is queued, or the time runs out. Answers whether there is one to pop. A
---- wait of 0 only looks, which is the same question `count` answers.
+--- wait of `math.huge` waits without a timeout -- until a message arrives, or the channel is
+--- closed with nothing in it, which answers false. A wait of 0 only looks, which is the same
+--- question `count` answers.
 ---@param milliseconds number
 ---@return boolean available
 function Channel:wait(milliseconds)
 	local pointer = self.channel
 	if pointer == nil then return false end
+	if milliseconds == math.huge then
+		return lib.threading_channel_wait(pointer, -1) ~= 0
+	end
 	return lib.threading_channel_wait(pointer, math.max(0, math.floor(milliseconds or 0))) ~= 0
 end
 
