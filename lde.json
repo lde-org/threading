@@ -1,7 +1,7 @@
 {
 	"name": "threading",
 	"description": "Threads for LuaJIT: functions run on threads of their own, in Lua states of their own",
-	"version": "0.2.3",
+	"version": "0.2.4",
 	"dependencies": {},
 	"features": {
 		"android": ["threading.android"]
