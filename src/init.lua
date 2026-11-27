@@ -114,6 +114,7 @@ local WORKER_RUNNER = string.dump(assert(load(string.format([==[
 ---@class threading.Handle
 ---@field private job ffi.cdata?
 ---@field private results table? # What the thread answered, once joined
+---@field private detached boolean? # Whether the thread was let go without being joined
 local Handle = {}
 Handle.__index = Handle
 
@@ -143,9 +144,11 @@ function Handle:done()
 end
 
 --- Waits for the thread, and answers with what its function returned. An error in the thread is
---- raised here. A handle is joined once; asking again answers the same.
+--- raised here. A handle is joined once; asking again answers the same. A detached handle is never
+--- joined, and asking raises.
 ---@return any ...
 function Handle:join()
+	if self.detached then error("threading: a detached thread cannot be joined", 2) end
 	local job = self.job
 	if job ~= nil then
 		self.job = nil
@@ -158,6 +161,20 @@ function Handle:join()
 		error("thread: " .. tostring(results[2]), 2)
 	end
 	return unpack(results, 2, results.n)
+end
+
+--- Lets go of the thread without waiting for it: it runs on and the process ending is what reclaims
+--- it. What a program calls for a thread it will not wait out before it exits -- a reader inside a
+--- read that takes seconds, a decoder that may never answer. The thread is not joined, and what it
+--- answers is never read. Its job, which includes the copy of the API and runner it reads as it
+--- starts, is kept for the life of the process: a detached thread has no joiner to give it back.
+function Handle:detach()
+	local job = self.job
+	if job == nil then return end
+	self.job = nil
+	self.results = nil
+	self.detached = true
+	lib.threading_detach(job)
 end
 
 --- The upvalues of a function, checked to be copies string.buffer can carry.

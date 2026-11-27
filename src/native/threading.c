@@ -5,6 +5,7 @@
  *
  * Nothing is linked against Lua: the program hands over the Lua C API it runs on, as function
  * pointers, so this works whatever executable or library the Lua runtime lives in. */
+#include <errno.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +16,6 @@
 #else
 #include <pthread.h>
 #include <time.h>
-#include <errno.h>
 #define THREADING_EXPORT __attribute__((visibility("default")))
 #endif
 
@@ -50,6 +50,7 @@ typedef struct threading_job {
 	char* result;
 	size_t result_len;
 	char* error; /* What went wrong outside the job itself: no state, a runner that did not load */
+	void* owned; /* The API table and runner copied for the thread; freed when it is joined */
 	int done;
 #ifdef _WIN32
 	HANDLE thread;
@@ -66,7 +67,7 @@ typedef struct threading_job {
  * `input` is the runner's own payload -- what it needs to set its state up -- and belongs to the
  * worker from here on: the runner frees it once it has read it. */
 typedef struct threading_worker {
-	const threading_api* api;
+	threading_api api; /* Copied in: the worker may outlive the state that made it */
 	char* runner;
 	size_t runner_len;
 	char* input;
@@ -182,12 +183,41 @@ static void* entry(void* arg)
 /* Starts the job's thread. Nonzero is the platform's error. */
 THREADING_EXPORT int threading_start(threading_job* job)
 {
+	/* The state that made the job may close before the thread has even started -- a program that
+	 * leaves a thread unjoined, or a thread that starts one and ends. That state owns the API
+	 * table and the runner text the job points into, so the thread gets copies of both. They are
+	 * freed when the job is joined, after the thread that reads them has finished. */
+	typedef struct threading_owned {
+		threading_api api;
+		char runner[];
+	} threading_owned;
+
+	size_t runner_len = job->runner_len;
+	threading_owned* owned = (threading_owned*)malloc(sizeof(threading_owned) + runner_len);
+	if (owned == NULL) return ENOMEM;
+	owned->api = *job->api;
+	memcpy(owned->runner, job->runner, runner_len);
+	job->owned = owned;
+	job->api = &owned->api;
+	job->runner = owned->runner;
+
 	job->done = 0;
 #ifdef _WIN32
 	job->thread = CreateThread(NULL, 0, entry, job, 0, NULL);
-	return job->thread == NULL ? (int)GetLastError() : 0;
+	if (job->thread == NULL) {
+		free(owned);
+		job->owned = NULL;
+		return (int)GetLastError();
+	}
+	return 0;
 #else
-	return pthread_create(&job->thread, NULL, entry, job);
+	int failed = pthread_create(&job->thread, NULL, entry, job);
+	if (failed != 0) {
+		free(owned);
+		job->owned = NULL;
+		return failed;
+	}
+	return 0;
 #endif
 }
 
@@ -209,6 +239,25 @@ THREADING_EXPORT void threading_join(threading_job* job)
 	CloseHandle(job->thread);
 #else
 	pthread_join(job->thread, NULL);
+#endif
+	/* The thread is done, so the copy of what the state it came from owned is no longer read. */
+	free(job->owned);
+	job->owned = NULL;
+}
+
+/* Lets go of the job's thread without waiting for it: the process no longer joins it. The thread
+ * keeps running, and the job -- including the copy of the API and runner it reads as it starts --
+ * is not freed here: a detached thread has no joiner to give it back, so it is kept for the life
+ * of the process. What a program calls for a thread it will not wait out before it ends. */
+THREADING_EXPORT void threading_detach(threading_job* job)
+{
+#ifdef _WIN32
+	if (job->thread != NULL) {
+		CloseHandle(job->thread);
+		job->thread = NULL;
+	}
+#else
+	pthread_detach(job->thread);
 #endif
 }
 
@@ -238,7 +287,7 @@ static char* copy_bytes(const char* bytes, size_t len)
 
 static void run_worker(threading_worker* worker)
 {
-	const threading_api* api = worker->api;
+	const threading_api* api = &worker->api;
 	lua_State* L = api->newstate();
 	if (L == NULL) {
 		worker->error = copy_text("could not create a Lua state", 28);
@@ -289,7 +338,7 @@ THREADING_EXPORT threading_worker* threading_worker_new(
 	threading_worker* worker = (threading_worker*)calloc(1, sizeof(threading_worker));
 	if (worker == NULL) return NULL;
 
-	worker->api = api;
+	worker->api = *api;
 	worker->runner = copy_bytes(runner, runner_len);
 	worker->runner_len = runner_len;
 	if (input_len > 0) {
@@ -336,6 +385,9 @@ THREADING_EXPORT int threading_worker_push(threading_worker* worker, threading_j
 	WORKER_LOCK(worker);
 	int refused = worker->job != NULL || worker->stopping;
 	if (!refused) {
+		/* The runner reads `job.api.alloc` in the worker's state, long after the state that
+		 * submitted the job may have closed: point it at the copy the worker owns. */
+		job->api = &worker->api;
 		job->done = 0;
 		worker->job = job;
 		WORKER_WAKE(worker);

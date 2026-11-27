@@ -31,11 +31,12 @@ native.CDEF = [[
 		char* result;
 		size_t result_len;
 		char* error;
+		void* owned;
 		int done;
 	} threading_job;
 
 	typedef struct threading_worker {
-		const threading_api* api;
+		threading_api api;
 		char* runner;
 		size_t runner_len;
 		char* input;
@@ -56,6 +57,7 @@ native.CDEF = [[
 	int threading_start(threading_job* job);
 	int threading_done(threading_job* job);
 	void threading_join(threading_job* job);
+	void threading_detach(threading_job* job);
 	threading_worker* threading_worker_new(const threading_api* api, const char* runner, size_t runner_len, const char* input, size_t input_len);
 	int threading_worker_start(threading_worker* worker);
 	int threading_worker_push(threading_worker* worker, threading_job* job);

@@ -33,6 +33,10 @@ end
 if not isWindows and not isMac then
 	-- A missing symbol is a link error here rather than a crash the first time a thread starts.
 	args[#args + 1] = "-Wl,--no-undefined"
+	-- A Lua state's FFI handle closes its libraries when the state is collected. A thread can still
+	-- be starting -- or running -- after the last state that loaded this one has closed; its code
+	-- must not be unmapped underneath it, so dlclose leaves the mapping in place.
+	args[#args + 1] = "-Wl,-z,nodelete"
 end
 
 if isMsvc then
